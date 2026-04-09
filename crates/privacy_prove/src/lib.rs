@@ -6,48 +6,50 @@ use std::cmp::max;
 use std::error::Error;
 use std::fs::read_to_string;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use cairo_program_runner_lib::types::HashFunc;
 use cairo_program_runner_lib::types::{PrivacySimpleBootloaderInput, SimpleBootloaderInput};
-use cairo_program_runner_lib::{ProgramInput, Task, TaskSpec, cairo_run_program};
+use cairo_program_runner_lib::{cairo_run_program, ProgramInput, Task, TaskSpec};
 use cairo_vm::vm::runners::cairo_pie::CairoPie;
 use circuit_air::verify::CircuitConfig;
-use circuit_cairo_air::verify::CairoVerifierConfig;
-use circuit_cairo_air::verify::build_fixed_cairo_circuit;
+use circuit_cairo_air::verify::build_cairo_verifier_circuit;
+use circuit_cairo_air::verify::build_fixed_cairo_circuit_with_capacities;
 use circuit_cairo_air::verify::prepare_cairo_proof_for_circuit_verifier;
+use circuit_cairo_air::verify::CairoVerifierConfig;
 use circuit_common::finalize::{add_zk_blinding, finalize_context};
 use circuit_common::preprocessed::PreprocessedCircuit;
 use circuit_prover::prover::{
     prepare_circuit_proof_for_circuit_verifier, prove_circuit_with_precompute,
 };
 use circuit_serialize::serialize::CircuitSerialize;
+use circuits::context::ContextCapacities;
 use circuits_stark_verifier::proof::ProofConfig;
 use itertools::chain;
 use privacy_circuit_verify::consts::{CAIRO_PCS_CONFIG, CIRCUIT_FRI_CONFIG, CIRCUIT_PCS_CONFIG};
 use privacy_circuit_verify::{
-    PrivacyProofOutput, compute_privacy_bootloader_output, get_cairo_proof_config,
-    get_cairo_verifier_config, get_preprocessed_cairo_circuit, get_privacy_bootloader_program,
-    get_proof_config, get_recursive_circuit_config,
+    compute_privacy_bootloader_output, get_cairo_proof_config, get_cairo_verifier_config,
+    get_privacy_bootloader_program, get_proof_config, get_recursive_circuit_config,
+    PrivacyProofOutput,
 };
 use serde_json::from_str;
 use starknet_types_core::felt::Felt;
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::utils::MaybeOwned;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
-use stwo::prover::CommitmentTreeProver;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::mempool::BaseColumnPool;
 use stwo::prover::poly::circle::PolyOps;
 use stwo::prover::poly::twiddles::TwiddleTree;
-use stwo_cairo_adapter::ProverInput;
+use stwo::prover::{CommitmentTreeProver, ProverMemoryMode};
 use stwo_cairo_adapter::adapter::adapt;
+use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
 use stwo_cairo_prover::prover::{prove_cairo, prove_cairo_with_precompute};
 use stwo_cairo_prover::witness::preprocessed_trace::gen_trace;
 use tempfile::NamedTempFile;
-use tracing::{Level, info, span};
+use tracing::{info, span, Level};
 
 use crate::consts::{
     CAIRO_PROVER_PARAMS, CAIRO_RUN_CONFIG, CIRCUIT_STORE_POLYNOMIALS_COEFFICIENTS,
@@ -57,16 +59,36 @@ pub struct RecursiveProverPrecomputes {
     pub base_column_pool: BaseColumnPool<SimdBackend>,
     pub twiddles: TwiddleTree<SimdBackend>,
     pub cairo_preprocessed_trace: Arc<PreProcessedTrace>,
-    pub cairo_preprocessed_tree: CommitmentTreeProver<SimdBackend, Blake2sM31MerkleChannel>,
+    pub cairo_preprocessed_tree: Mutex<CommitmentTreeProver<SimdBackend, Blake2sM31MerkleChannel>>,
     pub cairo_verifier_config: CairoVerifierConfig,
-    pub circuit_preprocessed_tree: CommitmentTreeProver<SimdBackend, Blake2sM31MerkleChannel>,
+    pub cairo_verifier_context_capacities: ContextCapacities,
+    pub circuit_preprocessed_tree:
+        Mutex<CommitmentTreeProver<SimdBackend, Blake2sM31MerkleChannel>>,
     pub preprocessed_circuit: PreprocessedCircuit,
     pub circuit_config: CircuitConfig,
     pub proof_config: ProofConfig,
+    pub memory_mode: ProverMemoryMode,
 }
 
 fn compress_proof(proof_bytes: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
     Ok(zstd::encode_all(proof_bytes, 3)?)
+}
+
+fn recursive_precompute_memory_mode() -> ProverMemoryMode {
+    match std::env::var("STWO_PROVER_MEMORY_MODE") {
+        Ok(value) => {
+            if value.eq_ignore_ascii_case("low_memory")
+                || value.eq_ignore_ascii_case("low-memory")
+                || value.eq_ignore_ascii_case("lowmemory")
+                || value.eq_ignore_ascii_case("checkpointed")
+            {
+                ProverMemoryMode::LowMemory
+            } else {
+                ProverMemoryMode::Fast
+            }
+        }
+        Err(_) => ProverMemoryMode::Fast,
+    }
 }
 
 /// Runs the program and generates a proof for it with params, bootloader and output format suitable
@@ -99,12 +121,15 @@ pub fn privacy_prove(pie: CairoPie) -> Result<PrivacyProofOutput, Box<dyn Error>
     })
 }
 
-pub fn prepare_recursive_prover_precomputes()
--> Result<Arc<RecursiveProverPrecomputes>, Box<dyn Error>> {
+pub fn prepare_recursive_prover_precomputes(
+) -> Result<Arc<RecursiveProverPrecomputes>, Box<dyn Error>> {
     let _span = span!(Level::INFO, "prepare_privacy_recursiveprover_precomputes").entered();
 
     let cairo_verifier_config = get_cairo_verifier_config()?;
-    let preprocessed_circuit = get_preprocessed_cairo_circuit(&cairo_verifier_config);
+    let mut novalue_context = build_cairo_verifier_circuit(&cairo_verifier_config);
+    add_zk_blinding(&mut novalue_context, [0; 32], CIRCUIT_FRI_CONFIG.n_queries);
+    let preprocessed_circuit = PreprocessedCircuit::preprocess_circuit(&mut novalue_context);
+    let cairo_verifier_context_capacities = novalue_context.capacities();
     let circuit_config = get_recursive_circuit_config();
     let proof_config = get_proof_config();
 
@@ -125,8 +150,12 @@ pub fn prepare_recursive_prover_precomputes()
             .circle_domain()
             .half_coset,
     );
+    let memory_mode = recursive_precompute_memory_mode();
 
-    info!("Prepare the cairo prover preprocessed trace and tree");
+    info!(
+        ?memory_mode,
+        "Prepare the cairo prover preprocessed trace and tree"
+    );
     let cairo_preprocessed_trace = Arc::new(
         CAIRO_PROVER_PARAMS
             .preprocessed_trace
@@ -134,41 +163,49 @@ pub fn prepare_recursive_prover_precomputes()
     );
     let cairo_preprocessed_trace_polys =
         SimdBackend::interpolate_columns(gen_trace(cairo_preprocessed_trace.clone()), &twiddles);
-    let cairo_preprocessed_tree = CommitmentTreeProver::<SimdBackend, Blake2sM31MerkleChannel>::new(
-        cairo_preprocessed_trace_polys,
-        CAIRO_PCS_CONFIG.fri_config.log_blowup_factor,
-        &twiddles,
-        CAIRO_PROVER_PARAMS.store_polynomials_coefficients,
-        Some(cairo_lifting_log_size),
-        &base_column_pool,
-    );
+    let cairo_preprocessed_tree =
+        CommitmentTreeProver::<SimdBackend, Blake2sM31MerkleChannel>::new_with_memory_mode(
+            cairo_preprocessed_trace_polys,
+            CAIRO_PCS_CONFIG.fri_config.log_blowup_factor,
+            &twiddles,
+            CAIRO_PROVER_PARAMS.store_polynomials_coefficients,
+            Some(cairo_lifting_log_size),
+            &base_column_pool,
+            memory_mode,
+        );
 
-    info!("Prepare the circuit prover preprocessed trace and tree");
+    info!(
+        ?memory_mode,
+        "Prepare the circuit prover preprocessed trace and tree"
+    );
     let circuit_preprocessed_trace = preprocessed_circuit
         .preprocessed_trace
         .get_trace::<SimdBackend>();
     let circuit_preprocessed_trace_polys =
         SimdBackend::interpolate_columns(circuit_preprocessed_trace, &twiddles);
     let circuit_preprocessed_tree =
-        CommitmentTreeProver::<SimdBackend, Blake2sM31MerkleChannel>::new(
+        CommitmentTreeProver::<SimdBackend, Blake2sM31MerkleChannel>::new_with_memory_mode(
             circuit_preprocessed_trace_polys,
             CIRCUIT_FRI_CONFIG.log_blowup_factor,
             &twiddles,
             CIRCUIT_STORE_POLYNOMIALS_COEFFICIENTS,
             circuit_config.config.lifting_log_size,
             &base_column_pool,
+            memory_mode,
         );
 
     Ok(Arc::new(RecursiveProverPrecomputes {
         base_column_pool,
         twiddles,
         cairo_preprocessed_trace,
-        cairo_preprocessed_tree,
+        cairo_preprocessed_tree: Mutex::new(cairo_preprocessed_tree),
         cairo_verifier_config,
-        circuit_preprocessed_tree,
+        cairo_verifier_context_capacities,
+        circuit_preprocessed_tree: Mutex::new(circuit_preprocessed_tree),
         preprocessed_circuit,
         circuit_config,
         proof_config,
+        memory_mode,
     }))
 }
 
@@ -182,14 +219,28 @@ pub fn privacy_recursive_prove(
     let (prover_input, output_preimage) = run_privacy_bootloader(pie)?;
 
     info!("Generate the cairo proof");
-    let cairo_proof = prove_cairo_with_precompute(
-        &precomputes.base_column_pool,
-        &precomputes.twiddles,
-        precomputes.cairo_preprocessed_trace.clone(),
-        MaybeOwned::Borrowed(&precomputes.cairo_preprocessed_tree),
-        prover_input,
-        CAIRO_PROVER_PARAMS,
-    )?;
+    let cairo_proof = {
+        let mut cairo_preprocessed_tree = precomputes
+            .cairo_preprocessed_tree
+            .lock()
+            .map_err(|_| std::io::Error::other("cairo preprocessed tree mutex poisoned"))?;
+        cairo_preprocessed_tree.materialize_evaluations_for_reuse(
+            &precomputes.twiddles,
+            &precomputes.base_column_pool,
+        );
+        let cairo_proof = prove_cairo_with_precompute(
+            &precomputes.base_column_pool,
+            &precomputes.twiddles,
+            precomputes.cairo_preprocessed_trace.clone(),
+            MaybeOwned::Borrowed(&cairo_preprocessed_tree),
+            prover_input,
+            CAIRO_PROVER_PARAMS,
+        )?;
+        if precomputes.memory_mode == ProverMemoryMode::LowMemory {
+            cairo_preprocessed_tree.release_recomputable_evaluations_low_memory();
+        }
+        cairo_proof
+    };
 
     info!("Prepare the cairo proof for the cairo-circuit verifier");
     let (proof, public_data) = prepare_cairo_proof_for_circuit_verifier(
@@ -200,11 +251,12 @@ pub fn privacy_recursive_prove(
     info!("Build the cairo-circuit verifier context");
     let (public_claim, _outputs, _program) = public_data.pack_into_u32s();
     let outputs = compute_privacy_bootloader_output(&output_preimage);
-    let mut context = build_fixed_cairo_circuit(
+    let mut context = build_fixed_cairo_circuit_with_capacities(
         &precomputes.cairo_verifier_config,
         proof,
         public_claim,
         vec![outputs],
+        Some(&precomputes.cairo_verifier_context_capacities),
     );
     if !context.is_circuit_valid() {
         return Err("Circuit is not valid".into());
@@ -219,14 +271,28 @@ pub fn privacy_recursive_prove(
     let context_values = context.values();
 
     info!("Prove the cairo-circuit verifier");
-    let circuit_proof = prove_circuit_with_precompute(
-        &precomputes.base_column_pool,
-        &precomputes.twiddles,
-        &precomputes.preprocessed_circuit,
-        MaybeOwned::Borrowed(&precomputes.circuit_preprocessed_tree),
-        context_values,
-        precomputes.circuit_config.config,
-    );
+    let circuit_proof = {
+        let mut circuit_preprocessed_tree = precomputes
+            .circuit_preprocessed_tree
+            .lock()
+            .map_err(|_| std::io::Error::other("circuit preprocessed tree mutex poisoned"))?;
+        circuit_preprocessed_tree.materialize_evaluations_for_reuse(
+            &precomputes.twiddles,
+            &precomputes.base_column_pool,
+        );
+        let circuit_proof = prove_circuit_with_precompute(
+            &precomputes.base_column_pool,
+            &precomputes.twiddles,
+            &precomputes.preprocessed_circuit,
+            MaybeOwned::Borrowed(&circuit_preprocessed_tree),
+            context_values,
+            precomputes.circuit_config.config,
+        );
+        if precomputes.memory_mode == ProverMemoryMode::LowMemory {
+            circuit_preprocessed_tree.release_recomputable_evaluations_low_memory();
+        }
+        circuit_proof
+    };
 
     info!("Prepare the circuit proof for the circuit verifier");
     let (proof_qm31s, _public_data) =
