@@ -40,6 +40,7 @@ use stwo::core::utils::MaybeOwned;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::mempool::BaseColumnPool;
+use stwo::prover::spill::log_mmap_stats;
 use stwo::prover::poly::circle::PolyOps;
 use stwo::prover::poly::twiddles::TwiddleTree;
 use stwo::prover::{CommitmentTreeProver, ProverMemoryMode};
@@ -68,6 +69,20 @@ pub struct RecursiveProverPrecomputes {
     pub circuit_config: CircuitConfig,
     pub proof_config: ProofConfig,
     pub memory_mode: ProverMemoryMode,
+}
+
+impl Drop for RecursiveProverPrecomputes {
+    fn drop(&mut self) {
+        eprintln!(
+            "RECURSIVE_PRECOMPUTES drop memory_mode={:?}",
+            self.memory_mode,
+        );
+        log_mmap_stats("recursive_precomputes:drop");
+    }
+}
+
+pub fn log_recursive_prover_mmap_stats(label: &str) {
+    log_mmap_stats(label);
 }
 
 fn compress_proof(proof_bytes: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -194,7 +209,7 @@ pub fn prepare_recursive_prover_precomputes(
             memory_mode,
         );
 
-    Ok(Arc::new(RecursiveProverPrecomputes {
+    let precomputes = Arc::new(RecursiveProverPrecomputes {
         base_column_pool,
         twiddles,
         cairo_preprocessed_trace,
@@ -206,7 +221,15 @@ pub fn prepare_recursive_prover_precomputes(
         circuit_config,
         proof_config,
         memory_mode,
-    }))
+    });
+    eprintln!(
+        "RECURSIVE_PRECOMPUTES created ptr={:p} strong_count={} memory_mode={:?}",
+        Arc::as_ptr(&precomputes),
+        Arc::strong_count(&precomputes),
+        precomputes.memory_mode,
+    );
+    log_mmap_stats("recursive_precomputes:created");
+    Ok(precomputes)
 }
 
 pub fn privacy_recursive_prove(
@@ -241,6 +264,7 @@ pub fn privacy_recursive_prove(
         }
         cairo_proof
     };
+    log_mmap_stats("privacy_recursive_prove:after_cairo");
 
     info!("Prepare the cairo proof for the cairo-circuit verifier");
     let (proof, public_data) = prepare_cairo_proof_for_circuit_verifier(
@@ -293,6 +317,7 @@ pub fn privacy_recursive_prove(
         }
         circuit_proof
     };
+    log_mmap_stats("privacy_recursive_prove:after_circuit");
 
     info!("Prepare the circuit proof for the circuit verifier");
     let (proof_qm31s, _public_data) =
