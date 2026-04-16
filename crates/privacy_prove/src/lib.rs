@@ -40,7 +40,7 @@ use stwo::core::utils::MaybeOwned;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::mempool::BaseColumnPool;
-use stwo::prover::spill::log_mmap_stats;
+use stwo::prover::spill::{log_mmap_stats, log_vm_walk};
 use stwo::prover::poly::circle::PolyOps;
 use stwo::prover::poly::twiddles::TwiddleTree;
 use stwo::prover::{CommitmentTreeProver, ProverMemoryMode};
@@ -78,11 +78,20 @@ impl Drop for RecursiveProverPrecomputes {
             self.memory_mode,
         );
         log_mmap_stats("recursive_precomputes:drop");
+        log_vm_walk("recursive_precomputes:drop");
     }
 }
 
 pub fn log_recursive_prover_mmap_stats(label: &str) {
     log_mmap_stats(label);
+}
+
+/// Snapshot task-level VM accounting and largest free VA gap.
+///
+/// Intended to distinguish allocator/phys_footprint retention (elevated `internal`/`phys`
+/// across proofs) from VA fragmentation (shrinking `largest_gap` while `phys` is fine).
+pub fn log_recursive_prover_vm_walk(label: &str) {
+    log_vm_walk(label);
 }
 
 fn compress_proof(proof_bytes: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -229,6 +238,7 @@ pub fn prepare_recursive_prover_precomputes(
         precomputes.memory_mode,
     );
     log_mmap_stats("recursive_precomputes:created");
+    log_vm_walk("recursive_precomputes:created");
     Ok(precomputes)
 }
 
@@ -265,6 +275,7 @@ pub fn privacy_recursive_prove(
         cairo_proof
     };
     log_mmap_stats("privacy_recursive_prove:after_cairo");
+    log_vm_walk("privacy_recursive_prove:after_cairo");
 
     info!("Prepare the cairo proof for the cairo-circuit verifier");
     let (proof, public_data) = prepare_cairo_proof_for_circuit_verifier(
@@ -318,6 +329,7 @@ pub fn privacy_recursive_prove(
         circuit_proof
     };
     log_mmap_stats("privacy_recursive_prove:after_circuit");
+    log_vm_walk("privacy_recursive_prove:after_circuit");
 
     info!("Prepare the circuit proof for the circuit verifier");
     let (proof_qm31s, _public_data) =
