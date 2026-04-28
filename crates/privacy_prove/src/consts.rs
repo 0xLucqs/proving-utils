@@ -2,6 +2,7 @@ use cairo_air::PreProcessedTraceVariant;
 use cairo_vm::cairo_run::CairoRunConfig;
 use cairo_vm::types::layout_name::LayoutName;
 use privacy_circuit_verify::consts::CAIRO_PCS_CONFIG;
+use stwo::prover::ProverMemoryMode;
 use stwo_cairo_prover::prover::{ChannelHash, ProverParameters};
 
 pub const CAIRO_RUN_CONFIG: CairoRunConfig<'_> = CairoRunConfig {
@@ -18,13 +19,16 @@ pub const CAIRO_RUN_CONFIG: CairoRunConfig<'_> = CairoRunConfig {
     allow_missing_builtins: Some(true),
 };
 
-pub const CAIRO_PROVER_PARAMS: ProverParameters = ProverParameters {
-    channel_hash: ChannelHash::Blake2sM31,
-    pcs_config: CAIRO_PCS_CONFIG,
-    preprocessed_trace: PreProcessedTraceVariant::CanonicalSmall,
-    channel_salt: 0,
-    store_polynomials_coefficients: true,
-    include_all_preprocessed_columns: true,
-};
+pub const fn cairo_prover_params(memory_mode: ProverMemoryMode) -> ProverParameters {
+    ProverParameters {
+        channel_hash: ChannelHash::Blake2sM31,
+        pcs_config: CAIRO_PCS_CONFIG,
+        preprocessed_trace: PreProcessedTraceVariant::CanonicalSmall,
+        channel_salt: 0,
+        store_polynomials_coefficients: true,
+        include_all_preprocessed_columns: true,
+        memory_mode,
+    }
+}
 
 pub const CIRCUIT_STORE_POLYNOMIALS_COEFFICIENTS: bool = true;

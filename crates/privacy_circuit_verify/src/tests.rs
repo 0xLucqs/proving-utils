@@ -81,6 +81,7 @@ pub mod slow_tests {
 
     use cairo_vm::vm::runners::cairo_pie::CairoPie;
     use privacy_prove::{prepare_recursive_prover_precomputes, privacy_recursive_prove};
+    use stwo::prover::ProverMemoryMode;
     use tracing_subscriber::fmt;
 
     use crate::consts::{
@@ -96,7 +97,7 @@ pub mod slow_tests {
         let project_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let pie_path = project_dir.join("../privacy_prove/test_data/privacy_tx_cairo_pie.zip");
         let pie = CairoPie::read_zip_file(&pie_path).unwrap();
-        let precomputes = prepare_recursive_prover_precomputes().unwrap();
+        let precomputes = prepare_recursive_prover_precomputes(ProverMemoryMode::Fast).unwrap();
         let proof_output = privacy_recursive_prove(pie, precomputes).unwrap();
 
         let proof_config = get_proof_config();
@@ -126,7 +127,7 @@ pub mod slow_tests {
         let project_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let pie_path = project_dir.join("../privacy_prove/test_data/privacy_tx_cairo_pie.zip");
         let pie = CairoPie::read_zip_file(&pie_path).unwrap();
-        let proof_output = privacy_prove::privacy_prove(pie).unwrap();
+        let proof_output = privacy_prove::privacy_prove(pie, ProverMemoryMode::Fast).unwrap();
 
         let proof_bytes = zstd::decode_all(proof_output.proof.as_slice()).unwrap();
         assert_eq!(
@@ -144,7 +145,7 @@ pub mod slow_tests {
         let project_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let pie_path = project_dir.join("../privacy_prove/test_data/privacy_tx_cairo_pie.zip");
         let pie = CairoPie::read_zip_file(&pie_path).unwrap();
-        let precomputes = prepare_recursive_prover_precomputes().unwrap();
+        let precomputes = prepare_recursive_prover_precomputes(ProverMemoryMode::Fast).unwrap();
         let proof_output = privacy_recursive_prove(pie, precomputes).unwrap();
 
         let proof_bytes = zstd::decode_all(proof_output.proof.as_slice()).unwrap();

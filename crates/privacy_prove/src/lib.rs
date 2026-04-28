@@ -43,7 +43,8 @@ use stwo::prover::mempool::BaseColumnPool;
 use stwo::prover::spill::{log_mmap_stats, log_vm_walk};
 use stwo::prover::poly::circle::PolyOps;
 use stwo::prover::poly::twiddles::TwiddleTree;
-use stwo::prover::{CommitmentTreeProver, ProverMemoryMode};
+use stwo::prover::CommitmentTreeProver;
+pub use stwo::prover::ProverMemoryMode;
 use stwo_cairo_adapter::adapter::adapt;
 use stwo_cairo_adapter::ProverInput;
 use stwo_cairo_common::preprocessed_columns::preprocessed_trace::PreProcessedTrace;
@@ -53,7 +54,7 @@ use tempfile::NamedTempFile;
 use tracing::{info, span, Level};
 
 use crate::consts::{
-    CAIRO_PROVER_PARAMS, CAIRO_RUN_CONFIG, CIRCUIT_STORE_POLYNOMIALS_COEFFICIENTS,
+    cairo_prover_params, CAIRO_RUN_CONFIG, CIRCUIT_STORE_POLYNOMIALS_COEFFICIENTS,
 };
 
 pub struct RecursiveProverPrecomputes {
@@ -98,33 +99,20 @@ fn compress_proof(proof_bytes: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
     Ok(zstd::encode_all(proof_bytes, 3)?)
 }
 
-fn recursive_precompute_memory_mode() -> ProverMemoryMode {
-    match std::env::var("STWO_PROVER_MEMORY_MODE") {
-        Ok(value) => {
-            if value.eq_ignore_ascii_case("low_memory")
-                || value.eq_ignore_ascii_case("low-memory")
-                || value.eq_ignore_ascii_case("lowmemory")
-                || value.eq_ignore_ascii_case("checkpointed")
-            {
-                ProverMemoryMode::LowMemory
-            } else {
-                ProverMemoryMode::Fast
-            }
-        }
-        Err(_) => ProverMemoryMode::Fast,
-    }
-}
-
 /// Runs the program and generates a proof for it with params, bootloader and output format suitable
 /// for the privacy circuit verifier.
-pub fn privacy_prove(pie: CairoPie) -> Result<PrivacyProofOutput, Box<dyn Error>> {
+pub fn privacy_prove(
+    pie: CairoPie,
+    memory_mode: ProverMemoryMode,
+) -> Result<PrivacyProofOutput, Box<dyn Error>> {
     let _span = span!(Level::INFO, "privacy_prove").entered();
 
     info!("Run privacy bootloader and get the prover input and output preimage");
     let (prover_input, output_preimage) = run_privacy_bootloader(pie)?;
 
     info!("Generate the cairo proof");
-    let cairo_proof = prove_cairo::<Blake2sM31MerkleChannel>(prover_input, CAIRO_PROVER_PARAMS)?;
+    let cairo_proof =
+        prove_cairo::<Blake2sM31MerkleChannel>(prover_input, cairo_prover_params(memory_mode))?;
 
     info!("Prepare the proof for the circuit verifier");
     let proof_config = get_cairo_proof_config();
@@ -146,6 +134,7 @@ pub fn privacy_prove(pie: CairoPie) -> Result<PrivacyProofOutput, Box<dyn Error>
 }
 
 pub fn prepare_recursive_prover_precomputes(
+    memory_mode: ProverMemoryMode,
 ) -> Result<Arc<RecursiveProverPrecomputes>, Box<dyn Error>> {
     let _span = span!(Level::INFO, "prepare_privacy_recursiveprover_precomputes").entered();
 
@@ -159,7 +148,8 @@ pub fn prepare_recursive_prover_precomputes(
 
     info!("Prepare the twiddles");
     let base_column_pool = BaseColumnPool::<SimdBackend>::new();
-    let cairo_lifting_log_size = CAIRO_PROVER_PARAMS
+    let cairo_params = cairo_prover_params(memory_mode);
+    let cairo_lifting_log_size = cairo_params
         .pcs_config
         .lifting_log_size
         .ok_or("Lifting log size is not set in Cairo's PcsConfig")?;
@@ -174,17 +164,13 @@ pub fn prepare_recursive_prover_precomputes(
             .circle_domain()
             .half_coset,
     );
-    let memory_mode = recursive_precompute_memory_mode();
 
     info!(
         ?memory_mode,
         "Prepare the cairo prover preprocessed trace and tree"
     );
-    let cairo_preprocessed_trace = Arc::new(
-        CAIRO_PROVER_PARAMS
-            .preprocessed_trace
-            .to_preprocessed_trace(),
-    );
+    let cairo_preprocessed_trace =
+        Arc::new(cairo_params.preprocessed_trace.to_preprocessed_trace());
     let cairo_preprocessed_trace_polys =
         SimdBackend::interpolate_columns(gen_trace(cairo_preprocessed_trace.clone()), &twiddles);
     let cairo_preprocessed_tree =
@@ -192,7 +178,7 @@ pub fn prepare_recursive_prover_precomputes(
             cairo_preprocessed_trace_polys,
             CAIRO_PCS_CONFIG.fri_config.log_blowup_factor,
             &twiddles,
-            CAIRO_PROVER_PARAMS.store_polynomials_coefficients,
+            cairo_params.store_polynomials_coefficients,
             Some(cairo_lifting_log_size),
             &base_column_pool,
             memory_mode,
@@ -267,9 +253,9 @@ pub fn privacy_recursive_prove(
             precomputes.cairo_preprocessed_trace.clone(),
             MaybeOwned::Borrowed(&cairo_preprocessed_tree),
             prover_input,
-            CAIRO_PROVER_PARAMS,
+            cairo_prover_params(precomputes.memory_mode),
         )?;
-        if precomputes.memory_mode == ProverMemoryMode::LowMemory {
+        if precomputes.memory_mode.rematerializes_evaluations() {
             cairo_preprocessed_tree.release_recomputable_evaluations_low_memory();
         }
         cairo_proof
@@ -322,8 +308,9 @@ pub fn privacy_recursive_prove(
             MaybeOwned::Borrowed(&circuit_preprocessed_tree),
             context_values,
             precomputes.circuit_config.config,
+            precomputes.memory_mode,
         );
-        if precomputes.memory_mode == ProverMemoryMode::LowMemory {
+        if precomputes.memory_mode.rematerializes_evaluations() {
             circuit_preprocessed_tree.release_recomputable_evaluations_low_memory();
         }
         circuit_proof
